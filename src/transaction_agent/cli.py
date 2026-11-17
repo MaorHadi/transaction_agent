@@ -17,10 +17,17 @@ from transaction_agent.backtest import (
 from transaction_agent.config import Settings
 from transaction_agent.data import store
 from transaction_agent.risk import RiskLimits
-from transaction_agent.strategies import MeanReversion, MovingAverageCrossover, Strategy
+from transaction_agent.strategies import (
+    MeanReversion,
+    ModelSignal,
+    MovingAverageCrossover,
+    Strategy,
+)
 
 STRATEGIES = ("ma_crossover", "mean_reversion")
 SWEEP_THRESHOLDS = (0.2, 0.4, 0.6, 0.8, 1.0)
+MODELS = ("logistic", "random_forest", "gradient_boosting")  # mirrors ml.models.MODELS
+ML_CONFIDENCES = (0.52, 0.55, 0.60, 0.65)
 
 
 def _candidates(strategy: str) -> list[Candidate]:
@@ -99,6 +106,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_cost_args(forward)
     forward.add_argument("--train-days", type=int, default=180)
     forward.add_argument("--test-days", type=int, default=60)
+
+    ml = commands.add_parser("ml", help="Train a model walk-forward and trade its predictions")
+    _add_market_args(ml)
+    ml.add_argument("--model", default="logistic", choices=MODELS)
+    ml.add_argument("--horizon", type=int, default=6, help="Candles ahead the model predicts")
+    ml.add_argument("--train-days", type=int, default=365)
+    ml.add_argument("--test-days", type=int, default=90)
+    _add_cost_args(ml)
     return parser
 
 
@@ -221,6 +236,59 @@ def _walkforward(args: argparse.Namespace, settings: Settings) -> None:
     print(f"  Buy-and-hold over the same span: {result.buy_and_hold_return:+.1%}")
 
 
+def _ml(args: argparse.Namespace, settings: Settings) -> None:
+    from transaction_agent.ml import classification_report, make_model, walk_forward_predict
+
+    candles = _load(args, settings)
+    per_day = timeframes.periods_per_year(args.timeframe) / 365
+    predictions = walk_forward_predict(
+        candles,
+        lambda: make_model(args.model),
+        train_size=round(args.train_days * per_day),
+        test_size=round(args.test_days * per_day),
+        horizon=args.horizon,
+    )
+    report = classification_report(predictions)
+    tested = candles.iloc[predictions.first_test_index :]
+
+    market = f"{args.symbol} {args.timeframe}"
+    print(f"{args.model} on {market}, predicting {args.horizon} candles ahead")
+    print(f"train {args.train_days} days, test {args.test_days} days, {predictions.folds} folds")
+    print(f"unseen data: {_span(tested)}")
+    print()
+    print("How good are the predictions?")
+    print(f"  Price actually rose          {report.base_rate:>8.1%}")
+    print(f"  Accuracy                     {report.accuracy:>8.1%}")
+    print(f"  ROC AUC (0.5 = coin flip)    {report.roc_auc:>8.3f}")
+    print(f"  Brier score                  {report.brier:>8.4f}")
+    print(f"  Brier, always base rate      {report.brier_baseline:>8.4f}")
+    print()
+    print("Is the confidence honest?")
+    print(f"  {'predicted range':<18}{'candles':>8}{'predicted':>11}{'actual':>9}")
+    for interval, row in report.calibration.iterrows():
+        label = f"{max(interval.left, 0):.0%} to {interval.right:.0%}"
+        print(f"  {label:<18}{int(row['count']):>8}{row['predicted']:>11.1%}{row['actual']:>9.1%}")
+    print()
+    print("Trading only above a confidence level:")
+    print(
+        f"  {'confidence':>10}{'return':>10}{'max dd':>10}"
+        f"{'trades':>8}{'win rate':>10}{'in market':>11}"
+    )
+    periods = timeframes.periods_per_year(args.timeframe)
+    strategy = ModelSignal(predictions.probabilities)
+    for confidence in ML_CONFIDENCES:
+        config = replace(_config(args), entry_threshold=ModelSignal.threshold_for(confidence))
+        result = run_backtest(
+            candles, strategy, config, start=predictions.first_test_index, risk=_risk(args)
+        )
+        metrics = compute_metrics(result, candles, periods)
+        print(
+            f"  {confidence:>10.0%}{metrics.total_return:>+10.1%}{metrics.max_drawdown:>10.1%}"
+            f"{metrics.trades:>8}{metrics.win_rate:>10.1%}{metrics.exposure:>11.1%}"
+        )
+    print(f"  buy-and-hold: {metrics.buy_and_hold_return:+.1%}")
+
+
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     settings = Settings()
@@ -229,6 +297,7 @@ def main(argv: list[str] | None = None) -> None:
         "backtest": _backtest,
         "sweep": _sweep,
         "walkforward": _walkforward,
+        "ml": _ml,
     }
     try:
         handlers[args.command](args, settings)
