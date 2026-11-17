@@ -20,7 +20,8 @@ class SimBroker:
         self._fee_rate = fee_rate
         self._slippage = slippage
         self._pending_buy: float | None = None
-        self._pending_sell = False
+        self._pending_sell: str | None = None  # the reason, when a sell is waiting
+        self.entry_price: float | None = None  # fill price of the open position
         self.fills: list[Fill] = []
 
     def cash(self) -> float:
@@ -37,8 +38,8 @@ class SimBroker:
             raise ValueError("notional must be positive")
         self._pending_buy = notional
 
-    def sell_all(self) -> None:
-        self._pending_sell = True
+    def sell_all(self, reason: str = "signal") -> None:
+        self._pending_sell = reason
 
     def on_open(self, timestamp: pd.Timestamp, open_price: float) -> None:
         """Fill any pending order at this candle's open."""
@@ -51,13 +52,24 @@ class SimBroker:
                 fee = quantity * price * self._fee_rate
                 self._cash -= quantity * price + fee
                 self._quantity += quantity
+                self.entry_price = price
                 self.fills.append(Fill(timestamp, Side.BUY, quantity, price, fee))
-        if self._pending_sell:
-            self._pending_sell = False
-            if self._quantity > 0:
-                price = open_price * (1 - self._slippage)
-                proceeds = self._quantity * price
-                fee = proceeds * self._fee_rate
-                self._cash += proceeds - fee
-                self.fills.append(Fill(timestamp, Side.SELL, self._quantity, price, fee))
-                self._quantity = 0.0
+        if self._pending_sell is not None:
+            reason, self._pending_sell = self._pending_sell, None
+            self.sell_now(timestamp, open_price, reason)
+
+    def sell_now(self, timestamp: pd.Timestamp, market_price: float, reason: str) -> None:
+        """Sell the whole position immediately at `market_price`, less slippage and fee.
+
+        Used for stop-losses, which trigger inside a candle and cannot wait for the
+        next open.
+        """
+        if self._quantity <= 0:
+            return
+        price = market_price * (1 - self._slippage)
+        proceeds = self._quantity * price
+        fee = proceeds * self._fee_rate
+        self._cash += proceeds - fee
+        self.fills.append(Fill(timestamp, Side.SELL, self._quantity, price, fee, reason))
+        self._quantity = 0.0
+        self.entry_price = None

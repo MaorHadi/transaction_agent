@@ -17,6 +17,7 @@ class Metrics:
     win_rate: float  # share of round trips that made money after fees
     fees_paid: float
     exposure: float  # share of candles spent holding a position
+    stop_outs: int = 0  # positions closed by the stop-loss
 
 
 def buy_and_hold_return(candles: pd.DataFrame, fee_rate: float, slippage: float) -> float:
@@ -47,6 +48,7 @@ def compute_metrics(
     result: BacktestResult, candles: pd.DataFrame, periods_per_year: float
 ) -> Metrics:
     equity = result.equity
+    candles = candles.loc[equity.index[0] : equity.index[-1]]  # the traded span only
     returns = equity.pct_change().dropna()
     volatility = returns.std()
     sharpe = returns.mean() / volatility * np.sqrt(periods_per_year) if volatility > 0 else 0.0
@@ -67,4 +69,5 @@ def compute_metrics(
         win_rate=sum(p > 0 for p in profits) / len(profits) if profits else 0.0,
         fees_paid=sum(fill.fee for fill in result.fills),
         exposure=float(holding.mean()),
+        stop_outs=sum(fill.reason == "stop_loss" for fill in result.fills),
     )

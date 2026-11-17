@@ -17,6 +17,7 @@ class Fill:
     quantity: float
     price: float  # after slippage
     fee: float  # in quote currency
+    reason: str = "signal"  # or "stop_loss", "kill_switch"
 
 
 class Broker(Protocol):

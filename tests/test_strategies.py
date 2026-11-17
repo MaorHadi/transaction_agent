@@ -1,6 +1,6 @@
 import pytest
 
-from transaction_agent.strategies import MovingAverageCrossover
+from transaction_agent.strategies import MeanReversion, MovingAverageCrossover
 
 
 def test_zero_until_enough_history(candles_factory):
@@ -24,3 +24,23 @@ def test_strength_is_clipped(candles_factory):
 def test_rejects_bad_lengths():
     with pytest.raises(ValueError):
         MovingAverageCrossover(fast=10, slow=10)
+
+
+def test_mean_reversion_is_bullish_below_the_average(candles_factory):
+    strategy = MeanReversion(window=4, full_strength_z=2.0)
+    closes = [100.0, 100.0, 100.0, 96.0]
+    # mean 99, population std sqrt(3), z = -3/sqrt(3) = -sqrt(3)
+    expected = (3**0.5) / 2.0
+    assert strategy.signal(candles_factory(closes, closes=closes)) == pytest.approx(expected)
+
+
+def test_mean_reversion_is_bearish_above_the_average(candles_factory):
+    strategy = MeanReversion(window=4, full_strength_z=1.0)
+    closes = [100.0, 100.0, 100.0, 104.0]
+    assert strategy.signal(candles_factory(closes, closes=closes)) == -1.0
+
+
+def test_mean_reversion_flat_prices_and_short_history(candles_factory):
+    strategy = MeanReversion(window=4)
+    assert strategy.signal(candles_factory([100.0] * 4, closes=[100.0] * 4)) == 0.0
+    assert strategy.signal(candles_factory([100.0, 90.0])) == 0.0

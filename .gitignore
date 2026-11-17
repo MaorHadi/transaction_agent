@@ -10,5 +10,5 @@ build/
 # Secrets: API keys live only here
 .env
 
-# Downloaded market data
-data/
+# Downloaded market data (root folder only; src/transaction_agent/data/ is code)
+/data/
