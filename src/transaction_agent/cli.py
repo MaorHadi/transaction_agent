@@ -1,6 +1,7 @@
 """Download candles from Alpaca and evaluate trading strategies on them."""
 
 import argparse
+import math
 from datetime import UTC, datetime, timedelta
 
 import pandas as pd
@@ -16,10 +17,17 @@ from transaction_agent.backtest import (
 from transaction_agent.config import Settings
 from transaction_agent.data import store
 from transaction_agent.portfolio import (
+    BreakoutBasket,
+    HoldEqual,
     PortfolioCandidate,
     PortfolioConfig,
     VolatilityTarget,
+    best_single_coin,
+    breakout_signals,
+    perfect_foresight_log_growth,
+    run_portfolio_backtest,
     summarize,
+    volatility_forecasts,
     walk_forward_portfolio,
 )
 from transaction_agent.portfolio.engine import Summary, align
@@ -29,6 +37,12 @@ from transaction_agent.strategies import ChannelBreakout
 # The "do nothing" baseline: never trading keeps the account exactly where it started.
 CASH_RETURN = 0.0
 BREAKOUT_WINDOWS = (20, 50, 100)
+VOLATILITY_TARGETS = (0.4, 0.6, 0.8)  # yearly volatility aimed for per coin
+# Coins with complete daily history on Alpaca back to 2021 (MKR left out: delisted in 2025).
+BASKET_SYMBOLS = (
+    "BTC/USD", "ETH/USD", "LINK/USD", "LTC/USD", "BCH/USD", "AAVE/USD", "UNI/USD",
+    "DOGE/USD", "AVAX/USD", "GRT/USD", "SUSHI/USD", "YFI/USD", "BAT/USD",
+)  # fmt: skip
 
 
 def _breakout_candidates() -> list[Candidate]:
@@ -107,6 +121,15 @@ def build_parser() -> argparse.ArgumentParser:
     portfolio.add_argument("--test-days", type=int, default=90)
     portfolio.add_argument("--fee", type=float, default=PortfolioConfig.fee_rate)
     portfolio.add_argument("--slippage", type=float, default=PortfolioConfig.slippage)
+
+    basket = commands.add_parser(
+        "basket", help="Breakout across many coins on daily candles, sized by forecast volatility"
+    )
+    basket.add_argument("--symbols", default=",".join(BASKET_SYMBOLS), help="Comma-separated")
+    basket.add_argument("--train-days", type=int, default=365)
+    basket.add_argument("--test-days", type=int, default=180)
+    basket.add_argument("--fee", type=float, default=PortfolioConfig.fee_rate)
+    basket.add_argument("--slippage", type=float, default=PortfolioConfig.slippage)
 
     volatility = commands.add_parser(
         "volatility", help="Forecast next-day volatility from hourly candles and score it"
@@ -256,6 +279,104 @@ def _portfolio(args: argparse.Namespace, settings: Settings) -> None:
         )
 
 
+def _basket(args: argparse.Namespace, settings: Settings) -> None:
+    symbols = [symbol.strip() for symbol in args.symbols.split(",")]
+
+    def load(timeframe: str) -> dict[str, pd.DataFrame]:
+        return {
+            symbol: store.load_candles(store.candle_path(settings.data_dir, symbol, timeframe))
+            for symbol in symbols
+        }
+
+    daily = load("1d")
+    forecasts = volatility_forecasts(load("1h")).dropna()
+    opens, closes = align(daily)
+    # Trade only on days where every coin has a price and a volatility forecast.
+    days = closes.index.intersection(forecasts.index)
+    opens, closes = opens.loc[days], closes.loc[days]
+    signals = {window: breakout_signals(daily, window) for window in BREAKOUT_WINDOWS}
+
+    per_year = timeframes.periods_per_year("1d")
+    cost_rate = args.fee + args.slippage
+    # Slices are about 1/13 of the account, so allow adjustments down to 1% of it.
+    config = PortfolioConfig(fee_rate=args.fee, slippage=args.slippage, min_trade_fraction=0.01)
+    sized = [
+        PortfolioCandidate(
+            f"window={window} target={target:.0%}",
+            BreakoutBasket(signals[window], forecasts, target),
+        )
+        for window in BREAKOUT_WINDOWS
+        for target in VOLATILITY_TARGETS
+    ]
+    plain = [
+        PortfolioCandidate(f"window={window}", BreakoutBasket(signals[window]))
+        for window in BREAKOUT_WINDOWS
+    ]
+    results = {
+        "breakout + forecast sizing": walk_forward_portfolio(
+            opens, closes, sized, args.train_days, args.test_days, config
+        ),
+        "breakout, full slices": walk_forward_portfolio(
+            opens, closes, plain, args.train_days, args.test_days, config
+        ),
+    }
+    main_result = results["breakout + forecast sizing"]
+    unseen = main_result.equity.index
+
+    print(f"Breakout basket on {len(symbols)} coins, daily candles, walk-forward")
+    print(f"train {args.train_days} days, test {args.test_days} days")
+    print(f"unseen data: {unseen[0]:%Y-%m-%d} to {unseen[-1]:%Y-%m-%d}, {len(unseen)} days")
+    print()
+    header = f"  {'test period':<24}{'chosen on training data':<28}"
+    print(f"{header}{'test':>8}{'hold':>8}{'trades':>7}")
+    for fold in main_result.folds:
+        period = f"{fold.test_start:%Y-%m-%d} to {fold.test_end:%m-%d}"
+        print(
+            f"  {period:<24}{fold.chosen:<28}{fold.test_return:>+8.1%}"
+            f"{fold.test_buy_and_hold:>+8.1%}{fold.test_trades:>7}"
+        )
+    print()
+    print(f"  {'on unseen data':<28}{'return':>10}{'worst drop':>12}{'Sharpe':>8}{'trades':>8}")
+    rows = [(label, summarize(r.equity, per_year), r.trades) for label, r in results.items()]
+    held = summarize(main_result.benchmark, per_year)
+    rows.append(("hold all coins equally", held, len(symbols)))
+    rows.append(("stay in cash", Summary(CASH_RETURN, 0.0, 0.0), 0))
+    for label, summary, trades in rows:
+        print(
+            f"  {label:<28}{summary.total_return:>+10.1%}{summary.max_drawdown:>12.1%}"
+            f"{summary.sharpe:>8.2f}{trades:>8}"
+        )
+
+    unseen_opens = opens.loc[unseen]
+    coin, growth = best_single_coin(unseen_opens, cost_rate)
+    log_growth = perfect_foresight_log_growth(unseen_opens, cost_rate)
+    daily_gain = math.expm1(log_growth / (len(unseen) - 1))
+    print()
+    print("Theoretical maximum over the same days, knowing the future (not achievable):")
+    print(f"  holding only the best coin ({coin}): {growth - 1:+.1%}")
+    print(
+        f"  switching to the best coin or cash every day: about 10^{log_growth / math.log(10):.0f} "
+        f"times the starting cash ({daily_gain:+.1%} per day on average)"
+    )
+
+    print()
+    print("Every setting, traded without interruption over all available days")
+    print(f"({days[0]:%Y-%m-%d} to {days[-1]:%Y-%m-%d}; no setting is chosen, nothing is fitted):")
+    print(f"  {'setting':<28}{'return':>10}{'worst drop':>12}{'Sharpe':>8}{'trades':>8}")
+    for candidate in sized + plain:
+        result = run_portfolio_backtest(opens, closes, candidate.strategy, config)
+        summary = summarize(result.equity, per_year)
+        print(
+            f"  {candidate.label:<28}{summary.total_return:>+10.1%}"
+            f"{summary.max_drawdown:>12.1%}{summary.sharpe:>8.2f}{result.trades:>8}"
+        )
+    hold = summarize(run_portfolio_backtest(opens, closes, HoldEqual(), config).equity, per_year)
+    print(
+        f"  {'hold all coins equally':<28}{hold.total_return:>+10.1%}"
+        f"{hold.max_drawdown:>12.1%}{hold.sharpe:>8.2f}{len(symbols):>8}"
+    )
+
+
 def _volatility(args: argparse.Namespace, settings: Settings) -> None:
     from transaction_agent.volatility import (
         input_correlations,
@@ -326,6 +447,7 @@ def main(argv: list[str] | None = None) -> None:
         "backtest": _backtest,
         "walkforward": _walkforward,
         "portfolio": _portfolio,
+        "basket": _basket,
         "volatility": _volatility,
         "correlations": _correlations,
     }
