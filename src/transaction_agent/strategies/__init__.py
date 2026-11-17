@@ -1,6 +1,4 @@
 from transaction_agent.strategies.base import Strategy
-from transaction_agent.strategies.ma_crossover import MovingAverageCrossover
-from transaction_agent.strategies.mean_reversion import MeanReversion
-from transaction_agent.strategies.model_signal import ModelSignal
+from transaction_agent.strategies.breakout import ChannelBreakout
 
-__all__ = ["MeanReversion", "ModelSignal", "MovingAverageCrossover", "Strategy"]
+__all__ = ["ChannelBreakout", "Strategy"]

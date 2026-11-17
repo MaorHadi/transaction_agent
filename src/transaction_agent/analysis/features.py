@@ -1,4 +1,10 @@
-"""Model inputs computed from candles.
+"""Candidate model inputs computed from candles.
+
+These were the inputs to direction-prediction models that have been removed:
+none of them relates to the direction of the next move, though the
+volatility-type ones relate to its size. They are kept for the correlation
+check, so any future input can be tested the same way before a model uses it.
+
 
 Every feature in a row uses only that candle and earlier ones, so a row is exactly
 what the bot would know when that candle closes.

@@ -9,7 +9,7 @@ from transaction_agent.backtest import (
 )
 from transaction_agent.backtest.metrics import max_drawdown
 from transaction_agent.execution import Side
-from transaction_agent.strategies import MovingAverageCrossover, Strategy
+from transaction_agent.strategies import ChannelBreakout, Strategy
 
 
 class Scripted(Strategy):
@@ -50,15 +50,17 @@ def test_strategy_never_sees_future_candles(candles_factory):
 
 
 def test_changing_the_future_does_not_change_past_fills(candles_factory):
-    opens = [100.0 + i + (5 if i % 7 == 0 else 0) for i in range(60)]
+    # A triangle wave: six candles up, six down, so the breakout rule buys and sells repeatedly.
+    opens = [100.0 + 8 * min(i % 12, 12 - i % 12) for i in range(60)]
     altered = opens[:40] + [o * 3 for o in opens[40:]]
-    strategy = MovingAverageCrossover(fast=3, slow=8, full_strength_gap=0.01)
-    config = BacktestConfig(entry_threshold=0.3)
+    strategy = ChannelBreakout(window=5)
+    config = BacktestConfig()
 
     original = run_backtest(candles_factory(opens), strategy, config)
     changed = run_backtest(candles_factory(altered), strategy, config)
 
     cutoff = candles_factory(opens).index[39]
+    assert len([f for f in original.fills if f.timestamp < cutoff]) >= 4
     assert [f for f in original.fills if f.timestamp < cutoff] == [
         f for f in changed.fills if f.timestamp < cutoff
     ]

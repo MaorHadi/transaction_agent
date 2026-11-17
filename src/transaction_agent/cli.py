@@ -1,7 +1,6 @@
 """Download candles from Alpaca and evaluate trading strategies on them."""
 
 import argparse
-from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pandas as pd
@@ -16,36 +15,40 @@ from transaction_agent.backtest import (
 )
 from transaction_agent.config import Settings
 from transaction_agent.data import store
-from transaction_agent.risk import RiskLimits
-from transaction_agent.strategies import (
-    MeanReversion,
-    ModelSignal,
-    MovingAverageCrossover,
-    Strategy,
+from transaction_agent.portfolio import (
+    PortfolioCandidate,
+    PortfolioConfig,
+    VolatilityTarget,
+    summarize,
+    walk_forward_portfolio,
 )
+from transaction_agent.portfolio.engine import Summary, align
+from transaction_agent.risk import RiskLimits
+from transaction_agent.strategies import ChannelBreakout
 
-STRATEGIES = ("ma_crossover", "mean_reversion")
-SWEEP_THRESHOLDS = (0.2, 0.4, 0.6, 0.8, 1.0)
-MODELS = ("logistic", "random_forest", "gradient_boosting")  # mirrors ml.models.MODELS
-ML_CONFIDENCES = (0.52, 0.55, 0.60, 0.65)
+# The "do nothing" baseline: never trading keeps the account exactly where it started.
+CASH_RETURN = 0.0
+BREAKOUT_WINDOWS = (20, 50, 100)
 
 
-def _candidates(strategy: str) -> list[Candidate]:
-    """The fixed, deliberately small set of settings that walk-forward chooses between."""
-    if strategy == "ma_crossover":
-        return [
-            Candidate(
-                f"fast={fast} slow={slow} thr={threshold}",
-                MovingAverageCrossover(fast, slow),
-                threshold,
-            )
-            for fast, slow in ((10, 50), (20, 100), (50, 200))
-            for threshold in (0.3, 0.6, 0.9)
-        ]
+def _breakout_candidates() -> list[Candidate]:
+    """The settings walk-forward chooses between: breakout's window length only."""
     return [
-        Candidate(f"window={window} thr={threshold}", MeanReversion(window), threshold)
-        for window in (20, 50, 100)
-        for threshold in (0.5, 0.75, 1.0)
+        Candidate(f"window={window}", ChannelBreakout(window), BacktestConfig.entry_threshold)
+        for window in BREAKOUT_WINDOWS
+    ]
+
+
+def _volatility_target_candidates(per_day: float, per_year: float) -> list[PortfolioCandidate]:
+    """Settings the multi-coin walk-forward chooses between. Windows are in days."""
+    return [
+        PortfolioCandidate(
+            f"target={target:.0%} window={days}d",
+            VolatilityTarget(target, round(days * per_day), per_year),
+            rebalance_every=round(per_day),
+        )
+        for target in (0.3, 0.5, 0.7)
+        for days in (14, 30)
     ]
 
 
@@ -58,7 +61,7 @@ def _add_market_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--timeframe", default="4h", choices=timeframes.SUPPORTED)
 
 
-def _add_cost_args(parser: argparse.ArgumentParser) -> None:
+def _add_account_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--fee", type=float, default=BacktestConfig.fee_rate)
     parser.add_argument("--slippage", type=float, default=BacktestConfig.slippage)
     parser.add_argument("--cash", type=float, default=BacktestConfig.initial_cash)
@@ -71,13 +74,6 @@ def _add_cost_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_strategy_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--strategy", default="ma_crossover", choices=STRATEGIES)
-    parser.add_argument("--fast", type=int, default=20, help="ma_crossover: fast average length")
-    parser.add_argument("--slow", type=int, default=100, help="ma_crossover: slow average length")
-    parser.add_argument("--window", type=int, default=20, help="mean_reversion: lookback length")
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="transaction-agent", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -87,44 +83,48 @@ def build_parser() -> argparse.ArgumentParser:
     download.add_argument("--start", type=_parse_date, help="YYYY-MM-DD, default 2 years ago")
     download.add_argument("--end", type=_parse_date, help="YYYY-MM-DD, default now")
 
-    backtest = commands.add_parser("backtest", help="Backtest a strategy on cached candles")
+    backtest = commands.add_parser("backtest", help="Backtest the breakout rule on cached candles")
     _add_market_args(backtest)
-    _add_strategy_args(backtest)
-    _add_cost_args(backtest)
-    backtest.add_argument("--threshold", type=float, default=BacktestConfig.entry_threshold)
-
-    sweep = commands.add_parser("sweep", help="Backtest a strategy across entry thresholds")
-    _add_market_args(sweep)
-    _add_strategy_args(sweep)
-    _add_cost_args(sweep)
+    backtest.add_argument("--window", type=int, default=50, help="Channel length, in candles")
+    _add_account_args(backtest)
 
     forward = commands.add_parser(
-        "walkforward", help="Choose settings on past data, score them on unseen data"
+        "walkforward", help="Choose breakout's window on past data, score it on unseen data"
     )
     _add_market_args(forward)
-    forward.add_argument("--strategy", default="ma_crossover", choices=STRATEGIES)
-    _add_cost_args(forward)
-    forward.add_argument("--train-days", type=int, default=180)
-    forward.add_argument("--test-days", type=int, default=60)
+    _add_account_args(forward)
+    forward.add_argument("--train-days", type=int, default=365)
+    forward.add_argument("--test-days", type=int, default=90)
 
-    ml = commands.add_parser("ml", help="Train a model walk-forward and trade its predictions")
-    _add_market_args(ml)
-    ml.add_argument("--model", default="logistic", choices=MODELS)
-    ml.add_argument("--horizon", type=int, default=6, help="Candles ahead the model predicts")
-    ml.add_argument("--train-days", type=int, default=365)
-    ml.add_argument("--test-days", type=int, default=90)
-    _add_cost_args(ml)
+    portfolio = commands.add_parser(
+        "portfolio", help="Walk-forward volatility targeting across one or more coins"
+    )
+    portfolio.add_argument(
+        "--symbols", default="BTC/USD,ETH/USD", help="Comma-separated, e.g. BTC/USD,ETH/USD"
+    )
+    portfolio.add_argument("--timeframe", default="4h", choices=timeframes.SUPPORTED)
+    portfolio.add_argument("--train-days", type=int, default=365)
+    portfolio.add_argument("--test-days", type=int, default=90)
+    portfolio.add_argument("--fee", type=float, default=PortfolioConfig.fee_rate)
+    portfolio.add_argument("--slippage", type=float, default=PortfolioConfig.slippage)
+
+    volatility = commands.add_parser(
+        "volatility", help="Forecast next-day volatility from hourly candles and score it"
+    )
+    volatility.add_argument("--symbol", default="BTC/USD")
+    volatility.add_argument("--train-days", type=int, default=365)
+    volatility.add_argument("--test-days", type=int, default=90)
+
+    correlations = commands.add_parser(
+        "correlations", help="Show how each candidate input relates to the future price move"
+    )
+    _add_market_args(correlations)
+    correlations.add_argument("--horizon", type=int, default=6, help="Candles ahead")
     return parser
 
 
 def _load(args: argparse.Namespace, settings: Settings) -> pd.DataFrame:
     return store.load_candles(store.candle_path(settings.data_dir, args.symbol, args.timeframe))
-
-
-def _strategy(args: argparse.Namespace) -> Strategy:
-    if args.strategy == "ma_crossover":
-        return MovingAverageCrossover(fast=args.fast, slow=args.slow)
-    return MeanReversion(window=args.window)
 
 
 def _config(args: argparse.Namespace) -> BacktestConfig:
@@ -162,16 +162,16 @@ def _download(args: argparse.Namespace, settings: Settings) -> None:
 
 def _backtest(args: argparse.Namespace, settings: Settings) -> None:
     candles = _load(args, settings)
-    strategy = _strategy(args)
-    config = replace(_config(args), entry_threshold=args.threshold)
-    result = run_backtest(candles, strategy, config, risk=_risk(args))
+    strategy = ChannelBreakout(window=args.window)
+    result = run_backtest(candles, strategy, _config(args), risk=_risk(args))
     metrics = compute_metrics(result, candles, timeframes.periods_per_year(args.timeframe))
 
-    print(f"{strategy.name} on {args.symbol} {args.timeframe}, entry threshold {args.threshold}")
+    print(f"{strategy.name} (window {args.window}) on {args.symbol} {args.timeframe}")
     print(_span(candles))
     rows = [
         ("Strategy return", f"{metrics.total_return:+.2%}"),
         ("Buy-and-hold return", f"{metrics.buy_and_hold_return:+.2%}"),
+        ("Stay-in-cash return", f"{CASH_RETURN:+.2%}"),
         ("Sharpe (annualised)", f"{metrics.sharpe:.2f}"),
         ("Max drawdown", f"{metrics.max_drawdown:.2%}"),
         ("Completed trades", f"{metrics.trades}"),
@@ -186,41 +186,19 @@ def _backtest(args: argparse.Namespace, settings: Settings) -> None:
         print(f"  Kill switch stopped trading on {result.halted_at:%Y-%m-%d}")
 
 
-def _sweep(args: argparse.Namespace, settings: Settings) -> None:
-    candles = _load(args, settings)
-    strategy = _strategy(args)
-    periods = timeframes.periods_per_year(args.timeframe)
-
-    print(f"{strategy.name} on {args.symbol} {args.timeframe}")
-    print(_span(candles))
-    print(
-        f"  {'threshold':>9}{'return':>10}{'max dd':>10}"
-        f"{'trades':>8}{'win rate':>10}{'fees':>10}"
-    )
-    for threshold in SWEEP_THRESHOLDS:
-        config = replace(_config(args), entry_threshold=threshold)
-        result = run_backtest(candles, strategy, config, risk=_risk(args))
-        metrics = compute_metrics(result, candles, periods)
-        print(
-            f"  {threshold:>9.1f}{metrics.total_return:>+10.1%}{metrics.max_drawdown:>10.1%}"
-            f"{metrics.trades:>8}{metrics.win_rate:>10.1%}{metrics.fees_paid:>10,.0f}"
-        )
-    print(f"  buy-and-hold: {metrics.buy_and_hold_return:+.1%}")
-
-
 def _walkforward(args: argparse.Namespace, settings: Settings) -> None:
     candles = _load(args, settings)
     per_day = timeframes.periods_per_year(args.timeframe) / 365
     result = walk_forward(
         candles,
-        _candidates(args.strategy),
+        _breakout_candidates(),
         train_size=round(args.train_days * per_day),
         test_size=round(args.test_days * per_day),
         config=_config(args),
         risk=_risk(args),
     )
 
-    print(f"{args.strategy} on {args.symbol} {args.timeframe}, walk-forward")
+    print(f"breakout on {args.symbol} {args.timeframe}, walk-forward")
     print(f"train {args.train_days} days, test {args.test_days} days; {_span(candles)}")
     print(
         f"  {'test period':<24}{'chosen on training data':<28}"
@@ -234,59 +212,110 @@ def _walkforward(args: argparse.Namespace, settings: Settings) -> None:
         )
     print(f"  Unseen-data return: {result.total_return:+.1%} over {result.trades} trades")
     print(f"  Buy-and-hold over the same span: {result.buy_and_hold_return:+.1%}")
+    print(f"  Staying in cash over the same span: {CASH_RETURN:+.1%}")
 
 
-def _ml(args: argparse.Namespace, settings: Settings) -> None:
-    from transaction_agent.ml import classification_report, make_model, walk_forward_predict
-
-    candles = _load(args, settings)
-    per_day = timeframes.periods_per_year(args.timeframe) / 365
-    predictions = walk_forward_predict(
-        candles,
-        lambda: make_model(args.model),
+def _portfolio(args: argparse.Namespace, settings: Settings) -> None:
+    symbols = [symbol.strip() for symbol in args.symbols.split(",")]
+    opens, closes = align(
+        {
+            symbol: store.load_candles(store.candle_path(settings.data_dir, symbol, args.timeframe))
+            for symbol in symbols
+        }
+    )
+    per_year = timeframes.periods_per_year(args.timeframe)
+    per_day = per_year / 365
+    result = walk_forward_portfolio(
+        opens,
+        closes,
+        _volatility_target_candidates(per_day, per_year),
         train_size=round(args.train_days * per_day),
         test_size=round(args.test_days * per_day),
-        horizon=args.horizon,
+        config=PortfolioConfig(fee_rate=args.fee, slippage=args.slippage),
     )
-    report = classification_report(predictions)
-    tested = candles.iloc[predictions.first_test_index :]
+    strategy, hold = summarize(result.equity, per_year), summarize(result.benchmark, per_year)
 
-    market = f"{args.symbol} {args.timeframe}"
-    print(f"{args.model} on {market}, predicting {args.horizon} candles ahead")
-    print(f"train {args.train_days} days, test {args.test_days} days, {predictions.folds} folds")
-    print(f"unseen data: {_span(tested)}")
-    print()
-    print("How good are the predictions?")
-    print(f"  Price actually rose          {report.base_rate:>8.1%}")
-    print(f"  Accuracy                     {report.accuracy:>8.1%}")
-    print(f"  ROC AUC (0.5 = coin flip)    {report.roc_auc:>8.3f}")
-    print(f"  Brier score                  {report.brier:>8.4f}")
-    print(f"  Brier, always base rate      {report.brier_baseline:>8.4f}")
-    print()
-    print("Is the confidence honest?")
-    print(f"  {'predicted range':<18}{'candles':>8}{'predicted':>11}{'actual':>9}")
-    for interval, row in report.calibration.iterrows():
-        label = f"{max(interval.left, 0):.0%} to {interval.right:.0%}"
-        print(f"  {label:<18}{int(row['count']):>8}{row['predicted']:>11.1%}{row['actual']:>9.1%}")
-    print()
-    print("Trading only above a confidence level:")
-    print(
-        f"  {'confidence':>10}{'return':>10}{'max dd':>10}"
-        f"{'trades':>8}{'win rate':>10}{'in market':>11}"
-    )
-    periods = timeframes.periods_per_year(args.timeframe)
-    strategy = ModelSignal(predictions.probabilities)
-    for confidence in ML_CONFIDENCES:
-        config = replace(_config(args), entry_threshold=ModelSignal.threshold_for(confidence))
-        result = run_backtest(
-            candles, strategy, config, start=predictions.first_test_index, risk=_risk(args)
-        )
-        metrics = compute_metrics(result, candles, periods)
+    print(f"volatility targeting on {', '.join(symbols)} {args.timeframe}, walk-forward")
+    print(f"train {args.train_days} days, test {args.test_days} days; {_span(closes)}")
+    header = f"  {'test period':<24}{'chosen on training data':<28}"
+    print(f"{header}{'test':>8}{'hold':>8}{'trades':>7}")
+    for fold in result.folds:
+        period = f"{fold.test_start:%Y-%m-%d} to {fold.test_end:%m-%d}"
         print(
-            f"  {confidence:>10.0%}{metrics.total_return:>+10.1%}{metrics.max_drawdown:>10.1%}"
-            f"{metrics.trades:>8}{metrics.win_rate:>10.1%}{metrics.exposure:>11.1%}"
+            f"  {period:<24}{fold.chosen:<28}{fold.test_return:>+8.1%}"
+            f"{fold.test_buy_and_hold:>+8.1%}{fold.test_trades:>7}"
         )
-    print(f"  buy-and-hold: {metrics.buy_and_hold_return:+.1%}")
+    print(f"  Unseen data, {result.trades} trades:")
+    print(f"  {'':<16}{'return':>10}{'max drawdown':>14}{'Sharpe':>8}")
+    cash = Summary(total_return=CASH_RETURN, sharpe=0.0, max_drawdown=0.0)
+    rows = (("strategy", strategy), ("hold equal parts", hold), ("stay in cash", cash))
+    for label, summary in rows:
+        print(
+            f"  {label:<16}{summary.total_return:>+10.1%}"
+            f"{summary.max_drawdown:>14.1%}{summary.sharpe:>8.2f}"
+        )
+
+
+def _volatility(args: argparse.Namespace, settings: Settings) -> None:
+    from transaction_agent.volatility import (
+        input_correlations,
+        realized_variance,
+        score_forecasts,
+        walk_forward_har,
+    )
+
+    hourly = store.load_candles(store.candle_path(settings.data_dir, args.symbol, "1h"))
+    variance = realized_variance(hourly)
+    correlations, band = input_correlations(variance)
+    forecasts = walk_forward_har(variance, args.train_days, args.test_days)
+    scores = score_forecasts(forecasts)
+
+    print(f"Next-day volatility forecast (HAR) on {args.symbol}, from hourly candles")
+    print(f"train {args.train_days} days, test {args.test_days} days")
+    print(
+        f"unseen data: {forecasts.index[0]:%Y-%m-%d} to {forecasts.index[-1]:%Y-%m-%d}, "
+        f"{len(forecasts)} days"
+    )
+    print()
+    print(f"Do the inputs relate to tomorrow's volatility? (noise band: +/-{band:.2f})")
+    for name, value in correlations.items():
+        verdict = "related" if abs(value) > band else "noise"
+        print(f"  {name.replace('_', ' '):<14}{value:>+8.2f}   {verdict}")
+    print()
+    print("Forecast quality on unseen data:")
+    print(f"  {'method':<26}{'correlation':>12}{'typical miss':>14}{'vs naive':>10}")
+    labels = {
+        "har": "HAR model",
+        "naive": "naive: tomorrow = today",
+        "average": "last month's average",
+    }
+    for method, label in labels.items():
+        row = scores.loc[method]
+        print(
+            f"  {label:<26}{row['correlation']:>12.2f}"
+            f"{row['error'] * 100:>10.1f} pts{row['vs_naive']:>+10.1%}"
+        )
+    print("  (typical miss is in points of yearly volatility; vs naive is squared error removed)")
+
+
+def _correlations(args: argparse.Namespace, settings: Settings) -> None:
+    from transaction_agent.analysis import feature_correlations
+
+    candles = _load(args, settings)
+    table, band = feature_correlations(candles, args.horizon)
+
+    print(f"Candidate inputs on {args.symbol} {args.timeframe}, against the move over the next")
+    print(f"{args.horizon} candles. {_span(candles)}")
+    print(f"Noise band: +/-{band:.3f}. Anything inside it is what an unrelated input shows.")
+    print()
+    print(f"  {'input':<20}{'direction':>10}{'':>10}{'size of move':>14}")
+    for name, row in table.iterrows():
+        direction = "related" if abs(row["direction"]) > band else "noise"
+        size = "related" if abs(row["size"]) > band else "noise"
+        print(
+            f"  {name:<20}{row['direction']:>+10.3f}  {direction:<8}"
+            f"{row['size']:>+14.3f}  {size}"
+        )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -295,9 +324,10 @@ def main(argv: list[str] | None = None) -> None:
     handlers = {
         "download": _download,
         "backtest": _backtest,
-        "sweep": _sweep,
         "walkforward": _walkforward,
-        "ml": _ml,
+        "portfolio": _portfolio,
+        "volatility": _volatility,
+        "correlations": _correlations,
     }
     try:
         handlers[args.command](args, settings)
