@@ -43,6 +43,20 @@ BASKET_SYMBOLS = (
     "BTC/USD", "ETH/USD", "LINK/USD", "LTC/USD", "BCH/USD", "AAVE/USD", "UNI/USD",
     "DOGE/USD", "AVAX/USD", "GRT/USD", "SUSHI/USD", "YFI/USD", "BAT/USD",
 )  # fmt: skip
+# Large, liquid US-listed funds covering stock indexes, sectors, countries, bonds and
+# commodities. Funds are used instead of single stocks so the list is not a hand-pick
+# of today's winners. All have traded since before 2016, where Alpaca's data begins.
+ETF_SYMBOLS = (
+    "SPY", "QQQ", "IWM", "DIA", "EFA", "EEM", "EWJ", "EWZ", "FXI", "EWG", "EWU",
+    "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE", "VNQ",
+    "TLT", "IEF", "LQD", "HYG", "GLD", "SLV", "USO", "DBC",
+)  # fmt: skip
+# Per universe: its symbols and the fee charged on each trade. Alpaca charges 0.25%
+# on crypto and no commission on US stocks and funds.
+UNIVERSES = {
+    "crypto": (BASKET_SYMBOLS, PortfolioConfig.fee_rate),
+    "etfs": (ETF_SYMBOLS, 0.0),
+}
 
 
 def _breakout_candidates() -> list[Candidate]:
@@ -125,10 +139,11 @@ def build_parser() -> argparse.ArgumentParser:
     basket = commands.add_parser(
         "basket", help="Breakout across many coins on daily candles, sized by forecast volatility"
     )
-    basket.add_argument("--symbols", default=",".join(BASKET_SYMBOLS), help="Comma-separated")
+    basket.add_argument("--universe", default="crypto", choices=tuple(UNIVERSES))
+    basket.add_argument("--symbols", help="Comma-separated; overrides the universe's own list")
     basket.add_argument("--train-days", type=int, default=365)
     basket.add_argument("--test-days", type=int, default=180)
-    basket.add_argument("--fee", type=float, default=PortfolioConfig.fee_rate)
+    basket.add_argument("--fee", type=float, help="Default: the universe's usual fee")
     basket.add_argument("--slippage", type=float, default=PortfolioConfig.slippage)
 
     volatility = commands.add_parser(
@@ -148,6 +163,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _load(args: argparse.Namespace, settings: Settings) -> pd.DataFrame:
     return store.load_candles(store.candle_path(settings.data_dir, args.symbol, args.timeframe))
+
+
+def _per_year(args: argparse.Namespace) -> float:
+    """Candles per year for the command's symbol and timeframe."""
+    return timeframes.periods_per_year(args.timeframe, timeframes.is_crypto(args.symbol))
 
 
 def _config(args: argparse.Namespace) -> BacktestConfig:
@@ -177,17 +197,21 @@ def _download(args: argparse.Namespace, settings: Settings) -> None:
     report = store.validate_candles(candles, args.timeframe)
     print(f"Saved {report.rows} candles to {path}")
     print(f"  from {candles.index[0]} to {candles.index[-1]}")
-    print(
-        f"  duplicates: {report.duplicates}, gaps: {report.gaps} "
-        f"({report.missing_candles} missing candles)"
-    )
+    if timeframes.is_crypto(args.symbol):
+        print(
+            f"  duplicates: {report.duplicates}, gaps: {report.gaps} "
+            f"({report.missing_candles} missing candles)"
+        )
+    else:
+        # Stock markets close on weekends and holidays, so gaps in time are normal.
+        print(f"  duplicates: {report.duplicates}")
 
 
 def _backtest(args: argparse.Namespace, settings: Settings) -> None:
     candles = _load(args, settings)
     strategy = ChannelBreakout(window=args.window)
     result = run_backtest(candles, strategy, _config(args), risk=_risk(args))
-    metrics = compute_metrics(result, candles, timeframes.periods_per_year(args.timeframe))
+    metrics = compute_metrics(result, candles, _per_year(args))
 
     print(f"{strategy.name} (window {args.window}) on {args.symbol} {args.timeframe}")
     print(_span(candles))
@@ -211,7 +235,7 @@ def _backtest(args: argparse.Namespace, settings: Settings) -> None:
 
 def _walkforward(args: argparse.Namespace, settings: Settings) -> None:
     candles = _load(args, settings)
-    per_day = timeframes.periods_per_year(args.timeframe) / 365
+    per_day = _per_year(args) / 365
     result = walk_forward(
         candles,
         _breakout_candidates(),
@@ -280,7 +304,14 @@ def _portfolio(args: argparse.Namespace, settings: Settings) -> None:
 
 
 def _basket(args: argparse.Namespace, settings: Settings) -> None:
-    symbols = [symbol.strip() for symbol in args.symbols.split(",")]
+    universe_symbols, universe_fee = UNIVERSES[args.universe]
+    symbols = (
+        [symbol.strip() for symbol in args.symbols.split(",")]
+        if args.symbols
+        else list(universe_symbols)
+    )
+    fee = universe_fee if args.fee is None else args.fee
+    crypto = all(timeframes.is_crypto(symbol) for symbol in symbols)
 
     def load(timeframe: str) -> dict[str, pd.DataFrame]:
         return {
@@ -289,41 +320,48 @@ def _basket(args: argparse.Namespace, settings: Settings) -> None:
         }
 
     daily = load("1d")
-    forecasts = volatility_forecasts(load("1h")).dropna()
     opens, closes = align(daily)
-    # Trade only on days where every coin has a price and a volatility forecast.
-    days = closes.index.intersection(forecasts.index)
-    opens, closes = opens.loc[days], closes.loc[days]
     signals = {window: breakout_signals(daily, window) for window in BREAKOUT_WINDOWS}
-
-    per_year = timeframes.periods_per_year("1d")
-    cost_rate = args.fee + args.slippage
-    # Slices are about 1/13 of the account, so allow adjustments down to 1% of it.
-    config = PortfolioConfig(fee_rate=args.fee, slippage=args.slippage, min_trade_fraction=0.01)
-    sized = [
-        PortfolioCandidate(
-            f"window={window} target={target:.0%}",
-            BreakoutBasket(signals[window], forecasts, target),
-        )
-        for window in BREAKOUT_WINDOWS
-        for target in VOLATILITY_TARGETS
-    ]
     plain = [
         PortfolioCandidate(f"window={window}", BreakoutBasket(signals[window]))
         for window in BREAKOUT_WINDOWS
     ]
-    results = {
-        "breakout + forecast sizing": walk_forward_portfolio(
-            opens, closes, sized, args.train_days, args.test_days, config
-        ),
-        "breakout, full slices": walk_forward_portfolio(
-            opens, closes, plain, args.train_days, args.test_days, config
-        ),
-    }
-    main_result = results["breakout + forecast sizing"]
+    sized = []
+    if crypto:
+        # Forecast sizing needs hourly candles around the clock, which only crypto has.
+        forecasts = volatility_forecasts(load("1h")).dropna()
+        # Trade only on days where every coin has a price and a volatility forecast.
+        days = closes.index.intersection(forecasts.index)
+        opens, closes = opens.loc[days], closes.loc[days]
+        sized = [
+            PortfolioCandidate(
+                f"window={window} target={target:.0%}",
+                BreakoutBasket(signals[window], forecasts, target),
+            )
+            for window in BREAKOUT_WINDOWS
+            for target in VOLATILITY_TARGETS
+        ]
+    days = closes.index
+
+    per_year = timeframes.periods_per_year("1d", crypto)
+    train_size = round(args.train_days * per_year / 365)
+    test_size = round(args.test_days * per_year / 365)
+    cost_rate = fee + args.slippage
+    # Slices are a small share of the account, so allow adjustments down to 1% of it.
+    config = PortfolioConfig(fee_rate=fee, slippage=args.slippage, min_trade_fraction=0.01)
+    results = {}
+    if sized:
+        results["breakout + forecast sizing"] = walk_forward_portfolio(
+            opens, closes, sized, train_size, test_size, config
+        )
+    results["breakout, full slices"] = walk_forward_portfolio(
+        opens, closes, plain, train_size, test_size, config
+    )
+    main_result = next(iter(results.values()))
     unseen = main_result.equity.index
 
-    print(f"Breakout basket on {len(symbols)} coins, daily candles, walk-forward")
+    print(f"Breakout basket on {len(symbols)} {args.universe}, daily candles, walk-forward")
+    print(f"fee {fee:.2%} and slippage {args.slippage:.2%} per trade")
     print(f"train {args.train_days} days, test {args.test_days} days")
     print(f"unseen data: {unseen[0]:%Y-%m-%d} to {unseen[-1]:%Y-%m-%d}, {len(unseen)} days")
     print()
@@ -339,7 +377,7 @@ def _basket(args: argparse.Namespace, settings: Settings) -> None:
     print(f"  {'on unseen data':<28}{'return':>10}{'worst drop':>12}{'Sharpe':>8}{'trades':>8}")
     rows = [(label, summarize(r.equity, per_year), r.trades) for label, r in results.items()]
     held = summarize(main_result.benchmark, per_year)
-    rows.append(("hold all coins equally", held, len(symbols)))
+    rows.append(("hold all equally", held, len(symbols)))
     rows.append(("stay in cash", Summary(CASH_RETURN, 0.0, 0.0), 0))
     for label, summary, trades in rows:
         print(
@@ -353,9 +391,9 @@ def _basket(args: argparse.Namespace, settings: Settings) -> None:
     daily_gain = math.expm1(log_growth / (len(unseen) - 1))
     print()
     print("Theoretical maximum over the same days, knowing the future (not achievable):")
-    print(f"  holding only the best coin ({coin}): {growth - 1:+.1%}")
+    print(f"  holding only the best one ({coin}): {growth - 1:+.1%}")
     print(
-        f"  switching to the best coin or cash every day: about 10^{log_growth / math.log(10):.0f} "
+        f"  switching to the best one or cash every day: about 10^{log_growth / math.log(10):.0f} "
         f"times the starting cash ({daily_gain:+.1%} per day on average)"
     )
 
@@ -372,7 +410,7 @@ def _basket(args: argparse.Namespace, settings: Settings) -> None:
         )
     hold = summarize(run_portfolio_backtest(opens, closes, HoldEqual(), config).equity, per_year)
     print(
-        f"  {'hold all coins equally':<28}{hold.total_return:>+10.1%}"
+        f"  {'hold all equally':<28}{hold.total_return:>+10.1%}"
         f"{hold.max_drawdown:>12.1%}{hold.sharpe:>8.2f}{len(symbols):>8}"
     )
 
